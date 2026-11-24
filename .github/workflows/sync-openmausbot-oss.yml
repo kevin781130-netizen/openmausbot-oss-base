@@ -1,0 +1,74 @@
+name: Sync OpenMausBot OSS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: openmausbot-oss-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'kevin781130-netizen/openmausbot-oss-base' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Prepare filtered OSS snapshot (no upstream code execution)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export GIT_TERMINAL_PROMPT=0
+          gh auth setup-git --hostname github.com
+          git init "$RUNNER_TEMP/oss-sync"
+          cd "$RUNNER_TEMP/oss-sync"
+          git remote add origin https://github.com/kevin781130-netizen/openmausbot-oss-base.git
+          git fetch --no-tags --depth=1 origin refs/heads/main
+          base="$(git rev-parse FETCH_HEAD)"
+          git fetch --no-tags --depth=1 https://github.com/milind-soni/OpenMausBot.git refs/heads/main
+          source="$(git rev-parse FETCH_HEAD)"
+          # Fail closed if the reviewed licensing boundary changes.
+          test "$(git rev-parse "$source:LICENSE")" = d645695673349e3947e8e5ae42332d0ac3164cd7
+          test "$(git rev-parse "$source:LICENSING.md")" = 0c68f59bfb373c64fd4de0634497f33054cfbd83
+          git cat-file -e "$source:NOTICE"
+          # Copy only a filtered tree; never import upstream commit ancestry.
+          git read-tree "$source"
+          git rm -rf --cached --ignore-unmatch -- enterprise .tmpexp .github/workflows
+          workflow=.github/workflows/sync-openmausbot-oss.yml
+          git ls-tree "$base" -- "$workflow" | git update-index --index-info
+          tree="$(git write-tree)"
+          test "$(git rev-parse "$tree:$workflow")" = "$(git rev-parse "$base:$workflow")"
+          python3 - "$tree" <<'PY'
+          import subprocess, sys
+          paths = subprocess.check_output(["git", "ls-tree", "-r", "-z", "--name-only", sys.argv[1]]).split(b"\0")
+          allowed = b".github/workflows/sync-openmausbot-oss.yml"
+          for p in paths:
+              q = p.lower()
+              if q.split(b"/")[0] in (b"enterprise", b".tmpexp") or (q.startswith(b".github/workflows/") and p != allowed):
+                  raise SystemExit("Excluded path present: " + repr(p))
+          PY
+          if [ "$tree" = "$(git rev-parse "$base^{tree}")" ]; then
+            echo "No OSS tree changes." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          commit="$(printf 'Sync OpenMausBot OSS snapshot\n\nUpstream: %s\nExcluded: enterprise/, .tmpexp/, upstream workflows.\n' "$source" | git commit-tree "$tree" -p "$base")"
+          branch="upstream-sync/${source:0:12}-${base:0:12}"
+          existing="$(git ls-remote --heads origin "refs/heads/$branch")"
+          if [ -z "$existing" ]; then
+            git push origin "$commit:refs/heads/$branch"
+          else
+            echo "Review branch already exists; no overwrite performed."
+          fi
+          {
+            echo "### OSS snapshot ready for review"
+            echo "- Upstream commit: `$source`"
+            echo "- Review branch: `$branch`"
+            echo "- [Compare and create pull request](https://github.com/kevin781130-netizen/openmausbot-oss-base/compare/main...$branch?expand=1)"
+            echo "- No upstream code or workflows executed. Review licensing, dependency changes, secrets, and compatibility before merging."
+          } >> "$GITHUB_STEP_SUMMARY"
